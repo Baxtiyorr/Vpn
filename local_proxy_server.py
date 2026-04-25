@@ -119,7 +119,7 @@ class SocketIoBridgeClient:
                 event.set()
 
     def connect(self):
-        self.sio.connect(self.remote_url, socketio_path=SOCKET_IO_PATH)
+        self.sio.connect(self.remote_url, socketio_path=SOCKET_IO_PATH, transports=["polling"])
 
     def disconnect(self):
         if self.sio.connected:

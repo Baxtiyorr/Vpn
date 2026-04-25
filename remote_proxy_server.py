@@ -2,6 +2,7 @@ import argparse
 import socket
 import threading
 from urllib.parse import urlsplit
+from wsgiref.simple_server import make_server
 
 import requests
 import socketio
@@ -16,7 +17,7 @@ from shared_protocol import (
 )
 
 
-sio = socketio.Server(async_mode="eventlet", cors_allowed_origins="*")
+sio = socketio.Server(async_mode="threading", cors_allowed_origins="*")
 app = socketio.WSGIApp(sio)
 tunnel_sockets = {}
 tunnel_lock = threading.Lock()
@@ -189,11 +190,9 @@ def main():
     parser.add_argument("--port", type=int, default=9000, help="Bind port")
     args = parser.parse_args()
 
-    import eventlet
-    import eventlet.wsgi
-
     print(f"[remote] listening on {args.host}:{args.port}")
-    eventlet.wsgi.server(eventlet.listen((args.host, args.port)), app)
+    httpd = make_server(args.host, args.port, app)
+    httpd.serve_forever()
 
 
 if __name__ == "__main__":
