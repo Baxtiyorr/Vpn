@@ -119,18 +119,52 @@ class SocketIoBridgeClient:
                 event.set()
 
     def connect(self):
+        if self.sio.connected:
+            return
         self.sio.connect(self.remote_url, socketio_path=SOCKET_IO_PATH, transports=["polling"])
+
+    def ensure_connected(self) -> bool:
+        if self.sio.connected:
+            return True
+        try:
+            self.connect()
+            return self.sio.connected
+        except Exception as exc:
+            print(f"[local] failed to reconnect to remote proxy: {exc}")
+            return False
 
     def disconnect(self):
         if self.sio.connected:
             self.sio.disconnect()
 
     def forward_http_request(self, message: HttpRequestMessage) -> HttpResponseMessage:
+        if not self.ensure_connected():
+            return HttpResponseMessage(
+                request_id=message.request_id,
+                status_code=502,
+                reason="Bad Gateway",
+                headers={"Content-Type": "text/plain; charset=utf-8"},
+                body_b64=b64_encode(b"Remote proxy is disconnected"),
+                error="remote disconnected",
+            )
+
         event = threading.Event()
         with self._lock:
             self._pending[message.request_id] = (event, None)
 
-        self.sio.emit("proxy:http_request", message.to_json())
+        try:
+            self.sio.emit("proxy:http_request", message.to_json())
+        except Exception:
+            if not self.ensure_connected():
+                return HttpResponseMessage(
+                    request_id=message.request_id,
+                    status_code=502,
+                    reason="Bad Gateway",
+                    headers={"Content-Type": "text/plain; charset=utf-8"},
+                    body_b64=b64_encode(b"Remote proxy emit failed"),
+                    error="emit failed",
+                )
+            self.sio.emit("proxy:http_request", message.to_json())
         arrived = event.wait(timeout=REQUEST_TIMEOUT_SECONDS)
 
         with self._lock:
@@ -148,19 +182,28 @@ class SocketIoBridgeClient:
         return response
 
     def tunnel_open(self, tunnel_id: str, target_host: str, target_port: int) -> bool:
+        if not self.ensure_connected():
+            return False
         event = threading.Event()
         with self._lock:
             self._tunnel_open_events[tunnel_id] = event
             self._tunnel_close_events[tunnel_id] = threading.Event()
             self._tunnel_chunks[tunnel_id] = b""
         msg = TunnelOpenMessage(tunnel_id=tunnel_id, target_host=target_host, target_port=target_port)
-        self.sio.emit("proxy:tunnel_open", msg.to_json())
+        try:
+            self.sio.emit("proxy:tunnel_open", msg.to_json())
+        except Exception:
+            if not self.ensure_connected():
+                return False
+            self.sio.emit("proxy:tunnel_open", msg.to_json())
         ok = event.wait(timeout=10)
         with self._lock:
             self._tunnel_open_events.pop(tunnel_id, None)
         return ok
 
     def tunnel_send(self, tunnel_id: str, data: bytes):
+        if not self.ensure_connected():
+            return
         self.sio.emit("proxy:tunnel_data", TunnelDataMessage(tunnel_id=tunnel_id, data_b64=b64_encode(data)).to_json())
 
     def tunnel_take_chunks(self, tunnel_id: str) -> bytes:
@@ -177,7 +220,8 @@ class SocketIoBridgeClient:
         return event.wait(timeout=timeout_seconds)
 
     def tunnel_close(self, tunnel_id: str):
-        self.sio.emit("proxy:tunnel_close", TunnelCloseMessage(tunnel_id=tunnel_id, reason="local close").to_json())
+        if self.sio.connected:
+            self.sio.emit("proxy:tunnel_close", TunnelCloseMessage(tunnel_id=tunnel_id, reason="local close").to_json())
         with self._lock:
             self._tunnel_open_events.pop(tunnel_id, None)
             self._tunnel_close_events.pop(tunnel_id, None)
