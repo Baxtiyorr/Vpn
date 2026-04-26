@@ -21,6 +21,12 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
+Для удаленного сервера (Render/VPS) дополнительно:
+
+```powershell
+pip install -r requirements-remote.txt
+```
+
 ## Запуск
 
 ### 1) Запуск удаленного прокси (сервер B)
