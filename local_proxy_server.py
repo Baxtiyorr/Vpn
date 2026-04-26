@@ -8,6 +8,7 @@ from http.server import BaseHTTPRequestHandler
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlsplit
 
+import requests
 import socketio
 
 from shared_protocol import (
@@ -69,12 +70,24 @@ def sanitize_headers(headers: Dict[str, str]) -> Dict[str, str]:
 class SocketIoBridgeClient:
     def __init__(self, remote_url: str):
         self.remote_url = remote_url
-        self.sio = socketio.Client(reconnection=True, logger=False, engineio_logger=False)
+        # Important: do not use system proxy for A->B control channel.
+        # Otherwise, after enabling system proxy, this client can recurse
+        # back into local proxy and create CONNECT loops.
+        self.http_session = requests.Session()
+        self.http_session.trust_env = False
+        self.sio = socketio.Client(
+            reconnection=True,
+            logger=False,
+            engineio_logger=False,
+            http_session=self.http_session,
+        )
         self._pending: Dict[str, Tuple[threading.Event, Optional[HttpResponseMessage]]] = {}
         self._tunnel_open_events: Dict[str, threading.Event] = {}
         self._tunnel_close_events: Dict[str, threading.Event] = {}
+        self._tunnel_close_reasons: Dict[str, str] = {}
         self._tunnel_chunks: Dict[str, bytes] = {}
         self._lock = threading.Lock()
+        self._connect_lock = threading.Lock()
 
         @self.sio.event
         def connect():
@@ -114,14 +127,23 @@ class SocketIoBridgeClient:
         def on_tunnel_close(payload: str):
             msg = TunnelCloseMessage.from_json(payload)
             with self._lock:
+                self._tunnel_close_reasons[msg.tunnel_id] = msg.reason or "remote closed"
                 event = self._tunnel_close_events.get(msg.tunnel_id)
             if event:
                 event.set()
 
     def connect(self):
-        if self.sio.connected:
-            return
-        self.sio.connect(self.remote_url, socketio_path=SOCKET_IO_PATH, transports=["polling"])
+        with self._connect_lock:
+            if self.sio.connected:
+                return
+            try:
+                self.sio.connect(self.remote_url, socketio_path=SOCKET_IO_PATH, transports=["websocket", "polling"])
+            except Exception as exc:
+                # During concurrent reconnect attempts socketio may report
+                # "Client is not in a disconnected state". Treat this as
+                # non-fatal and let ensure_connected() re-check.
+                if "not in a disconnected state" not in str(exc):
+                    raise
 
     def ensure_connected(self) -> bool:
         if self.sio.connected:
@@ -134,8 +156,10 @@ class SocketIoBridgeClient:
             return False
 
     def disconnect(self):
-        if self.sio.connected:
-            self.sio.disconnect()
+        with self._connect_lock:
+            if self.sio.connected:
+                self.sio.disconnect()
+        self.http_session.close()
 
     def forward_http_request(self, message: HttpRequestMessage) -> HttpResponseMessage:
         if not self.ensure_connected():
@@ -181,30 +205,43 @@ class SocketIoBridgeClient:
             )
         return response
 
-    def tunnel_open(self, tunnel_id: str, target_host: str, target_port: int) -> bool:
+    def tunnel_open(self, tunnel_id: str, target_host: str, target_port: int) -> Tuple[bool, Optional[str]]:
         if not self.ensure_connected():
-            return False
+            return False, "socket.io disconnected"
         event = threading.Event()
         with self._lock:
             self._tunnel_open_events[tunnel_id] = event
             self._tunnel_close_events[tunnel_id] = threading.Event()
+            self._tunnel_close_reasons.pop(tunnel_id, None)
             self._tunnel_chunks[tunnel_id] = b""
         msg = TunnelOpenMessage(tunnel_id=tunnel_id, target_host=target_host, target_port=target_port)
         try:
             self.sio.emit("proxy:tunnel_open", msg.to_json())
         except Exception:
             if not self.ensure_connected():
-                return False
+                return False, "socket.io reconnect failed"
             self.sio.emit("proxy:tunnel_open", msg.to_json())
         ok = event.wait(timeout=10)
+        reason = None
+        if not ok:
+            with self._lock:
+                close_event = self._tunnel_close_events.get(tunnel_id)
+                if close_event and close_event.is_set():
+                    reason = self._tunnel_close_reasons.get(tunnel_id, "remote refused tunnel")
+                else:
+                    reason = "timeout waiting tunnel_opened"
         with self._lock:
             self._tunnel_open_events.pop(tunnel_id, None)
-        return ok
+        return ok, reason
 
     def tunnel_send(self, tunnel_id: str, data: bytes):
         if not self.ensure_connected():
             return
-        self.sio.emit("proxy:tunnel_data", TunnelDataMessage(tunnel_id=tunnel_id, data_b64=b64_encode(data)).to_json())
+        try:
+            self.sio.emit("proxy:tunnel_data", TunnelDataMessage(tunnel_id=tunnel_id, data_b64=b64_encode(data)).to_json())
+        except Exception:
+            # Tunnel is best-effort; caller loop handles close/error paths.
+            return
 
     def tunnel_take_chunks(self, tunnel_id: str) -> bytes:
         with self._lock:
@@ -225,6 +262,7 @@ class SocketIoBridgeClient:
         with self._lock:
             self._tunnel_open_events.pop(tunnel_id, None)
             self._tunnel_close_events.pop(tunnel_id, None)
+            self._tunnel_close_reasons.pop(tunnel_id, None)
             self._tunnel_chunks.pop(tunnel_id, None)
 
 
@@ -393,9 +431,14 @@ class LocalProxyHandler(BaseHTTPRequestHandler):
         target_host, target_port_s = self.path.rsplit(":", 1)
         target_port = int(target_port_s)
         tunnel_id = new_request_id()
-        opened = bridge.tunnel_open(tunnel_id=tunnel_id, target_host=target_host, target_port=target_port)
+        opened, open_error = bridge.tunnel_open(tunnel_id=tunnel_id, target_host=target_host, target_port=target_port)
         if not opened:
-            self.send_error(502, "Cannot open tunnel on remote proxy")
+            print(f"[local] tunnel open failed for {target_host}:{target_port} -> {open_error}")
+            try:
+                self.send_error(502, f"Cannot open tunnel on remote proxy ({open_error})")
+            except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):
+                # Browser already dropped socket while we were opening tunnel.
+                pass
             return
 
         self.send_response(200, "Connection Established")
@@ -415,23 +458,32 @@ class LocalProxyHandler(BaseHTTPRequestHandler):
 
                 remote_data = bridge.tunnel_take_chunks(tunnel_id)
                 if remote_data:
-                    self.connection.sendall(remote_data)
+                    try:
+                        self.connection.sendall(remote_data)
+                    except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):
+                        break
 
                 if bridge.tunnel_wait_close(tunnel_id, timeout_seconds=0.001):
                     break
         finally:
             bridge.tunnel_close(tunnel_id)
+            # CONNECT request should terminate this handler session.
+            # Without explicit close, leftover TLS bytes may be parsed as a
+            # new HTTP request and produce "Bad request version" noise.
+            self.close_connection = True
 
     def log_message(self, format: str, *args):
         print(f"[local] {self.client_address[0]} - {format % args}")
 
 
-def run_local_proxy(local_port: int, remote_urls: List[str], rotate_every_seconds: int):
+def run_local_proxy(local_host: str, local_port: int, remote_urls: List[str], rotate_every_seconds: int):
     bridge_manager = RotatingBridgeManager(remote_urls=remote_urls, rotate_every_seconds=rotate_every_seconds)
     LocalProxyHandler.bridge_manager = bridge_manager
-    server = ThreadedTCPServer((LISTEN_HOST, local_port), LocalProxyHandler)
+    server = ThreadedTCPServer((local_host, local_port), LocalProxyHandler)
 
-    system_proxy = WindowsSystemProxyManager(LISTEN_HOST, local_port)
+    # System proxy should point to loopback on this machine even when
+    # server listens on 0.0.0.0 for LAN clients.
+    system_proxy = WindowsSystemProxyManager("127.0.0.1", local_port)
     system_proxy.enable()
 
     def shutdown():
@@ -450,7 +502,7 @@ def run_local_proxy(local_port: int, remote_urls: List[str], rotate_every_second
     atexit.register(shutdown)
 
     try:
-        print(f"[local] listening on {LISTEN_HOST}:{local_port}")
+        print(f"[local] listening on {local_host}:{local_port}")
         print(f"[local] forwarding to remote socket.io nodes: {', '.join(remote_urls)}")
         print(f"[local] route rotation interval: {rotate_every_seconds} seconds")
         server.serve_forever()
@@ -462,6 +514,11 @@ def run_local_proxy(local_port: int, remote_urls: List[str], rotate_every_second
 
 def main():
     parser = argparse.ArgumentParser(description="Local HTTP proxy that forwards via Socket.IO")
+    parser.add_argument(
+        "--listen-host",
+        default=LISTEN_HOST,
+        help="Local bind host. Use 127.0.0.1 for local only, 0.0.0.0 for LAN clients.",
+    )
     parser.add_argument("--local-port", type=int, default=6767, help="Local HTTP proxy port")
     parser.add_argument(
         "--remote-urls",
@@ -477,6 +534,7 @@ def main():
     args = parser.parse_args()
     remote_urls = [x.strip() for x in args.remote_urls.split(",") if x.strip()]
     run_local_proxy(
+        local_host=args.listen_host,
         local_port=args.local_port,
         remote_urls=remote_urls,
         rotate_every_seconds=args.rotate_every_seconds,

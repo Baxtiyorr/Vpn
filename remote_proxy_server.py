@@ -1,31 +1,19 @@
 import argparse
-import socket
-import socketserver
-import threading
+import asyncio
 from urllib.parse import urlsplit
-from wsgiref.simple_server import WSGIServer, make_server
 
-import requests
+import aiohttp
+from aiohttp import web
 import socketio
 
-from shared_protocol import (
-    HttpRequestMessage,
-    HttpResponseMessage,
-    TunnelCloseMessage,
-    TunnelDataMessage,
-    TunnelOpenMessage,
-    b64_encode,
-)
+from shared_protocol import HttpRequestMessage, HttpResponseMessage, TunnelCloseMessage, TunnelDataMessage, TunnelOpenMessage, b64_encode
 
 
-sio = socketio.Server(async_mode="threading", cors_allowed_origins="*")
-app = socketio.WSGIApp(sio)
-tunnel_sockets = {}
-tunnel_lock = threading.Lock()
-
-
-class ThreadingWSGIServer(socketserver.ThreadingMixIn, WSGIServer):
-    daemon_threads = True
+sio = socketio.AsyncServer(async_mode="aiohttp", cors_allowed_origins="*")
+app = web.Application()
+sio.attach(app)
+tunnel_streams = {}
+tunnel_lock = asyncio.Lock()
 
 
 HOP_BY_HOP_HEADERS = {
@@ -59,28 +47,31 @@ def normalize_url(req: HttpRequestMessage) -> str:
 
 
 @sio.event
-def connect(sid, environ):
+async def connect(sid, environ):
     print(f"[remote] local proxy connected: {sid}")
 
 
 @sio.event
-def disconnect(sid):
+async def disconnect(sid):
     print(f"[remote] local proxy disconnected: {sid}")
     to_close = []
-    with tunnel_lock:
-        for tunnel_id, (owner_sid, sock) in list(tunnel_sockets.items()):
+    async with tunnel_lock:
+        for tunnel_id, state in list(tunnel_streams.items()):
+            owner_sid = state["sid"]
             if owner_sid == sid:
-                to_close.append((tunnel_id, sock))
-                tunnel_sockets.pop(tunnel_id, None)
-    for _, sock in to_close:
+                to_close.append((tunnel_id, state))
+                tunnel_streams.pop(tunnel_id, None)
+    for _, state in to_close:
+        writer = state["writer"]
+        writer.close()
         try:
-            sock.close()
+            await writer.wait_closed()
         except Exception:
             pass
 
 
 @sio.on("proxy:http_request")
-def on_http_request(sid, payload):
+async def on_http_request(sid, payload):
     req = HttpRequestMessage.from_json(payload)
     print(f"[remote] request {req.request_id} -> {req.method} {req.target_host}:{req.target_port}{req.path}")
 
@@ -91,23 +82,24 @@ def on_http_request(sid, payload):
         outgoing_headers = sanitize_outgoing_headers(req.headers)
         outgoing_headers["Host"] = parsed.netloc
 
-        response = requests.request(
-            method=method,
-            url=url,
-            headers=outgoing_headers,
-            data=req.body,
-            timeout=req.timeout_seconds,
-            allow_redirects=False,
-        )
-
-        message = HttpResponseMessage(
-            request_id=req.request_id,
-            status_code=response.status_code,
-            reason=response.reason or "",
-            headers=dict(response.headers),
-            body_b64=b64_encode(response.content),
-            error=None,
-        )
+        timeout = aiohttp.ClientTimeout(total=req.timeout_seconds)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.request(
+                method=method,
+                url=url,
+                headers=outgoing_headers,
+                data=req.body,
+                allow_redirects=False,
+            ) as response:
+                body = await response.read()
+                message = HttpResponseMessage(
+                    request_id=req.request_id,
+                    status_code=response.status,
+                    reason=response.reason or "",
+                    headers=dict(response.headers),
+                    body_b64=b64_encode(body),
+                    error=None,
+                )
     except Exception as exc:
         message = HttpResponseMessage(
             request_id=req.request_id,
@@ -118,75 +110,80 @@ def on_http_request(sid, payload):
             error=str(exc),
         )
 
-    sio.emit("proxy:http_response", message.to_json(), to=sid)
+    await sio.emit("proxy:http_response", message.to_json(), to=sid)
 
 
 @sio.on("proxy:tunnel_open")
-def on_tunnel_open(sid, payload):
+async def on_tunnel_open(sid, payload):
     msg = TunnelOpenMessage.from_json(payload)
     print(f"[remote] tunnel open {msg.tunnel_id} -> {msg.target_host}:{msg.target_port}")
     try:
-        upstream = socket.create_connection((msg.target_host, msg.target_port), timeout=20)
-        upstream.settimeout(1.0)
-        with tunnel_lock:
-            tunnel_sockets[msg.tunnel_id] = (sid, upstream)
-        sio.emit("proxy:tunnel_opened", msg.to_json(), to=sid)
+        reader, writer = await asyncio.wait_for(asyncio.open_connection(msg.target_host, msg.target_port), timeout=20)
+        async with tunnel_lock:
+            tunnel_streams[msg.tunnel_id] = {"sid": sid, "reader": reader, "writer": writer}
+        await sio.emit("proxy:tunnel_opened", msg.to_json(), to=sid)
 
-        def pump_remote_to_local():
+        async def pump_remote_to_local():
             try:
                 while True:
-                    try:
-                        chunk = upstream.recv(32768)
-                    except socket.timeout:
-                        continue
+                    chunk = await reader.read(32768)
                     if not chunk:
                         break
                     data_msg = TunnelDataMessage(tunnel_id=msg.tunnel_id, data_b64=b64_encode(chunk))
-                    sio.emit("proxy:tunnel_data", data_msg.to_json(), to=sid)
+                    await sio.emit("proxy:tunnel_data", data_msg.to_json(), to=sid)
             except Exception:
                 pass
             finally:
                 close_msg = TunnelCloseMessage(tunnel_id=msg.tunnel_id, reason="remote closed")
-                sio.emit("proxy:tunnel_close", close_msg.to_json(), to=sid)
-                with tunnel_lock:
-                    _, sock = tunnel_sockets.pop(msg.tunnel_id, (None, None))
-                if sock:
+                await sio.emit("proxy:tunnel_close", close_msg.to_json(), to=sid)
+                async with tunnel_lock:
+                    state = tunnel_streams.pop(msg.tunnel_id, None)
+                if state:
+                    out_writer = state["writer"]
+                    out_writer.close()
                     try:
-                        sock.close()
+                        await out_writer.wait_closed()
                     except Exception:
                         pass
 
-        threading.Thread(target=pump_remote_to_local, daemon=True).start()
+        asyncio.create_task(pump_remote_to_local())
     except Exception as exc:
         close_msg = TunnelCloseMessage(tunnel_id=msg.tunnel_id, reason=str(exc))
-        sio.emit("proxy:tunnel_close", close_msg.to_json(), to=sid)
+        await sio.emit("proxy:tunnel_close", close_msg.to_json(), to=sid)
 
 
 @sio.on("proxy:tunnel_data")
-def on_tunnel_data(sid, payload):
+async def on_tunnel_data(sid, payload):
     msg = TunnelDataMessage.from_json(payload)
-    with tunnel_lock:
-        state = tunnel_sockets.get(msg.tunnel_id)
+    async with tunnel_lock:
+        state = tunnel_streams.get(msg.tunnel_id)
     if not state:
         return
-    _, upstream = state
+    upstream = state["writer"]
     try:
-        upstream.sendall(msg.data)
+        upstream.write(msg.data)
+        await upstream.drain()
     except Exception:
         close_msg = TunnelCloseMessage(tunnel_id=msg.tunnel_id, reason="send failed")
-        sio.emit("proxy:tunnel_close", close_msg.to_json(), to=sid)
+        await sio.emit("proxy:tunnel_close", close_msg.to_json(), to=sid)
 
 
 @sio.on("proxy:tunnel_close")
-def on_tunnel_close(sid, payload):
+async def on_tunnel_close(sid, payload):
     msg = TunnelCloseMessage.from_json(payload)
-    with tunnel_lock:
-        _, upstream = tunnel_sockets.pop(msg.tunnel_id, (None, None))
-    if upstream:
+    async with tunnel_lock:
+        state = tunnel_streams.pop(msg.tunnel_id, None)
+    if state:
+        upstream = state["writer"]
+        upstream.close()
         try:
-            upstream.close()
+            await upstream.wait_closed()
         except Exception:
             pass
+
+
+async def health(request):
+    return web.json_response({"status": "ok"})
 
 
 def main():
@@ -195,9 +192,10 @@ def main():
     parser.add_argument("--port", type=int, default=9000, help="Bind port")
     args = parser.parse_args()
 
+    app.router.add_get("/", health)
+    app.router.add_get("/health", health)
     print(f"[remote] listening on {args.host}:{args.port}")
-    httpd = make_server(args.host, args.port, app, server_class=ThreadingWSGIServer)
-    httpd.serve_forever()
+    web.run_app(app, host=args.host, port=args.port)
 
 
 if __name__ == "__main__":
