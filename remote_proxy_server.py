@@ -1,8 +1,9 @@
 import argparse
 import socket
+import socketserver
 import threading
 from urllib.parse import urlsplit
-from wsgiref.simple_server import make_server
+from wsgiref.simple_server import WSGIServer, make_server
 
 import requests
 import socketio
@@ -21,6 +22,10 @@ sio = socketio.Server(async_mode="threading", cors_allowed_origins="*")
 app = socketio.WSGIApp(sio)
 tunnel_sockets = {}
 tunnel_lock = threading.Lock()
+
+
+class ThreadingWSGIServer(socketserver.ThreadingMixIn, WSGIServer):
+    daemon_threads = True
 
 
 HOP_BY_HOP_HEADERS = {
@@ -191,7 +196,7 @@ def main():
     args = parser.parse_args()
 
     print(f"[remote] listening on {args.host}:{args.port}")
-    httpd = make_server(args.host, args.port, app)
+    httpd = make_server(args.host, args.port, app, server_class=ThreadingWSGIServer)
     httpd.serve_forever()
 
 
